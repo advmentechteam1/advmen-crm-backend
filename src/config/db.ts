@@ -29,10 +29,43 @@ export async function connectDB(): Promise<void> {
     const dbType = isAtlas ? 'MongoDB Atlas Cluster' : 'MongoDB';
     logger.info(`✅ ${dbType} Connected Successfully: ${conn.connection.host}/${conn.connection.name}`);
 
-    // Ensure all critical indexes on attendances collection are built
+    // Ensure 'attendances' is our sole attendance collection (never drop 'attendances'!)
     try {
-      const attCol = conn.connection.db?.collection('attendances');
-      if (attCol) {
+      const db = conn.connection.db;
+      if (db) {
+        const collections = await db.listCollections().toArray();
+        const hasLegacySingular = collections.some((c) => c.name === 'attendance');
+
+        // If legacy singular 'attendance' collection exists, merge docs into 'attendances'
+        if (hasLegacySingular) {
+          logger.info('🔄 Checking if legacy "attendance" collection has records to merge into "attendances"...');
+          const legacyCol = db.collection('attendance');
+          const attendancesCol = db.collection('attendances');
+
+          const legacyDocs = await legacyCol.find({}).toArray();
+          if (legacyDocs.length > 0) {
+            const bulkOps = legacyDocs.map((doc) => ({
+              updateOne: {
+                filter: { _id: doc._id },
+                update: { $setOnInsert: doc },
+                upsert: true,
+              },
+            }));
+            await attendancesCol.bulkWrite(bulkOps, { ordered: false });
+            logger.info(`✅ Merged ${legacyDocs.length} records into single "attendances" collection.`);
+          }
+
+          // Clean up legacy singular collection
+          try {
+            await legacyCol.drop();
+            logger.info('🗑️ Successfully removed legacy "attendance" collection. Only "attendances" remains.');
+          } catch (dropErr: any) {
+            logger.warn('Could not drop legacy attendance collection:', dropErr.message);
+          }
+        }
+
+        // Build indexes on the single 'attendances' collection
+        const attCol = db.collection('attendances');
         await attCol.createIndex({ date: -1 }, { background: true });
         await attCol.createIndex({ userId: 1, date: 1 }, { background: true });
         await attCol.createIndex({ userId: 1, date: -1 }, { background: true });
@@ -46,10 +79,10 @@ export async function connectDB(): Promise<void> {
         await attCol.createIndex({ organizationId: 1, date: 1, status: 1 }, { background: true });
         await attCol.createIndex({ loginTime: -1 }, { background: true });
         await attCol.createIndex({ punchIn: -1 }, { background: true });
-        logger.info('⚡ Attendance collection indexes verified and ensured.');
+        logger.info('⚡ Single unified "attendances" collection indexes verified.');
       }
     } catch (idxErr: any) {
-      logger.warn('Index initialization note:', idxErr.message);
+      logger.warn('Attendance collection setup note:', idxErr.message);
     }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);

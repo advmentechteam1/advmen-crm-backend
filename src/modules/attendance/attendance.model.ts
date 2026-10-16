@@ -329,4 +329,4 @@ AttendanceSchema.index({ organizationId: 1, date: 1, status: 1 });
 AttendanceSchema.index({ loginTime: -1 });
 AttendanceSchema.index({ externalRecordId: 1 });
 
-export const AttendanceModel = mongoose.model<IAttendance>('Attendance', AttendanceSchema);
+export const AttendanceModel = mongoose.model<IAttendance>('Attendance', AttendanceSchema, 'attendances');

@@ -13,10 +13,7 @@ async function bootstrap() {
   // 2. Automatically Seed Production & Demo Initial Records
   await seedDatabase().catch((err) => logger.warn('⚠️ Seeding note:', err.message));
 
-  // 2.1 Clean up duplicate attendance records in background
-  import('./modules/attendance/attendance.service.js')
-    .then(({ attendanceService }) => attendanceService.deduplicateAttendanceRecords())
-    .catch((err) => logger.warn('Attendance deduplication init note:', err.message));
+
 
   // 3. Initialize Express Application & HTTP Server
   const app = createApp();

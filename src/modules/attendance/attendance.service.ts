@@ -211,7 +211,217 @@ export function formatSecondsToDuration(totalSeconds: number): string {
   return `${hours}h ${remainingMins}m ${remainingSecs}s`;
 }
 
+/**
+ * Combines multiple attendance documents for the same employee on the same date
+ * into a single unified record with all login sessions, all lunch breaks,
+ * and accurate active status.
+ */
+export function mergeAttendanceDocsForDay<T extends Record<string, any>>(docs: T[]): any {
+  if (!docs || docs.length === 0) return null;
+  if (docs.length === 1) return normalizeAttendanceSessions(docs[0]);
+
+  // Sort docs chronologically by login time or creation time
+  const sorted = [...docs].sort((a, b) => {
+    const tA = toValidAttendanceDate(a.loginTime || a.punchIn || a.createdAt, a.date)?.getTime() || 0;
+    const tB = toValidAttendanceDate(b.loginTime || b.punchIn || b.createdAt, b.date)?.getTime() || 0;
+    return tA - tB;
+  });
+
+  const latestDoc = sorted[sorted.length - 1];
+  const earliestDoc = sorted[0];
+
+  // Collect all login events across all docs
+  const rawEvents: any[] = [];
+  for (const d of sorted) {
+    if (Array.isArray(d.loginEvents) && d.loginEvents.length > 0) {
+      for (const ev of d.loginEvents) {
+        rawEvents.push({
+          ...ev,
+          ipAddress: ev.ipAddress || d.ipAddress,
+          userAgent: ev.userAgent || d.userAgent,
+        });
+      }
+    } else {
+      const lTime = toValidAttendanceDate(d.loginTime || d.punchIn || d.createdAt, d.date);
+      if (lTime) {
+        rawEvents.push({
+          loginTime: lTime,
+          logoutTime: toValidAttendanceDate(d.logoutTime || d.punchOut, d.date),
+          logoutBy: d.logoutBy || 'EMPLOYEE',
+          logoutAdminName: d.logoutAdminName,
+          ipAddress: d.ipAddress,
+          userAgent: d.userAgent,
+          punchType: d.punchType,
+        });
+      }
+    }
+  }
+
+  // Collect all lunch breaks across all docs
+  const rawLunchBreaks: IAttendanceLunchBreak[] = [];
+  for (const d of sorted) {
+    if (Array.isArray(d.lunchBreaks) && d.lunchBreaks.length > 0) {
+      for (const lb of d.lunchBreaks) {
+        if (!lb || !lb.startTime) continue;
+        const lbStart = toValidAttendanceDate(lb.startTime, d.date);
+        if (!lbStart) continue;
+        // Avoid duplicate lunch breaks within 60s
+        const isDup = rawLunchBreaks.some((existing) => {
+          const exStart = toValidAttendanceDate(existing.startTime, d.date);
+          return exStart && Math.abs(exStart.getTime() - lbStart.getTime()) < 60000;
+        });
+        if (!isDup) {
+          rawLunchBreaks.push(lb);
+        }
+      }
+    }
+  }
+
+  // Find doc with valid selfie
+  const selfieDoc = sorted.find((d) => {
+    const s = d.selfieUrl || d.selfie || d.selfieData;
+    return typeof s === 'string' && s.length > 20;
+  }) || latestDoc;
+
+  // Location: pick non-empty location
+  const locDoc = sorted.find((d) => d.location && d.location.address && d.location.address !== 'N/A') || latestDoc;
+
+  // Check if any doc is currently active (no logoutTime and no punchOut)
+  const isAnyActive = sorted.some((d) => {
+    const out = toValidAttendanceDate(d.logoutTime || d.punchOut, d.date);
+    return !out;
+  });
+
+  const merged = {
+    ...latestDoc,
+    _id: selfieDoc._id || latestDoc._id,
+    date: earliestDoc.date || latestDoc.date,
+    loginTime: earliestDoc.loginTime || earliestDoc.punchIn || earliestDoc.createdAt,
+    logoutTime: isAnyActive ? undefined : (latestDoc.logoutTime || latestDoc.punchOut),
+    loginEvents: rawEvents,
+    lunchBreaks: rawLunchBreaks,
+    totalLunchDurationSeconds: rawLunchBreaks.reduce((acc, b) => acc + (b.durationSeconds || 0), 0),
+    isOnLunch: Boolean(latestDoc.isOnLunch || rawLunchBreaks.some((b) => b.status === 'ONGOING' || !b.endTime)),
+    currentLunchStart: latestDoc.currentLunchStart || rawLunchBreaks.find((b) => b.status === 'ONGOING' || !b.endTime)?.startTime,
+    selfieUrl: selfieDoc?.selfieUrl || latestDoc.selfieUrl,
+    selfie: selfieDoc?.selfie || latestDoc.selfie,
+    selfieData: selfieDoc?.selfieData || latestDoc.selfieData,
+    location: locDoc?.location || latestDoc.location,
+    status: sorted.some((d) => d.status === 'HALF_DAY') ? 'HALF_DAY' : latestDoc.status,
+  };
+
+  return normalizeAttendanceSessions(merged);
+}
+
 export class AttendanceService {
+  /**
+   * Flexible employee resolver that supports:
+   * 1. Mongo ObjectId (_id)
+   * 2. employeeId / empId (e.g. "EMP-2026-0028" or "emp-2026-0028")
+   * 3. Email address
+   * 4. Synthesizes a valid employee profile from Attendance collection if not yet in User collection
+   */
+  async findUserFlexible(
+    identifier: string,
+    organizationId?: string
+  ): Promise<{
+    _id: string;
+    employeeId?: string;
+    name: string;
+    email: string;
+    phone?: string;
+    role: string;
+    department?: string;
+    organizationId: string;
+    avatarUrl?: string;
+  }> {
+    if (!identifier || typeof identifier !== 'string') {
+      throw AppError.badRequest('Valid employee identifier is required');
+    }
+
+    const trimmed = identifier.trim();
+
+    // 1. Try UserModel.findById if identifier is a valid 24-character hex ObjectId
+    if (mongoose.isValidObjectId(trimmed)) {
+      const u = await UserModel.findById(trimmed).lean();
+      if (u) {
+        return {
+          _id: u._id.toString(),
+          employeeId: u.employeeId,
+          name: u.name,
+          email: u.email,
+          phone: u.phone,
+          role: u.role,
+          department: u.department,
+          organizationId: u.organizationId || organizationId || 'org_advmen_platform',
+          avatarUrl: u.avatarUrl,
+        };
+      }
+    }
+
+    // 2. Try UserModel.findOne with case-insensitive employeeId, empId, email, or name
+    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`^${escaped}$`, 'i');
+
+    const u = await UserModel.findOne({
+      $or: [
+        { employeeId: regex },
+        { empId: regex },
+        { email: regex },
+        { name: regex },
+      ],
+      ...(organizationId ? { organizationId } : {}),
+    }).lean();
+
+    if (u) {
+      return {
+        _id: u._id.toString(),
+        employeeId: u.employeeId,
+        name: u.name,
+        email: u.email,
+        phone: u.phone,
+        role: u.role,
+        department: u.department,
+        organizationId: u.organizationId || organizationId || 'org_advmen_platform',
+        avatarUrl: u.avatarUrl,
+      };
+    }
+
+    // 3. Fallback: Search Attendance collection directly (for synced attendance app staff)
+    const attConditions: any[] = [
+      { userId: trimmed },
+      { employeeId: regex },
+      { empId: regex },
+      { userName: regex },
+      { empName: regex },
+    ];
+    if (mongoose.isValidObjectId(trimmed)) {
+      attConditions.push({ _id: new mongoose.Types.ObjectId(trimmed) });
+    }
+
+    const att = await AttendanceModel.findOne({
+      $or: attConditions,
+      ...(organizationId ? { organizationId } : {}),
+    })
+      .select('-selfieData -selfie')
+      .lean();
+
+    if (att) {
+      return {
+        _id: att.userId || att.employeeId || trimmed,
+        employeeId: att.employeeId || (att as any).empId || trimmed,
+        name: att.userName || (att as any).empName || (att as any).name || 'Employee',
+        email: att.userEmail || '',
+        phone: att.userPhone || '',
+        role: att.role || 'Employee',
+        department: att.department || 'Sales & Business Development',
+        organizationId: att.organizationId || organizationId || 'org_advmen_platform',
+      };
+    }
+
+    throw AppError.notFound(`Employee profile not found for "${trimmed}"`);
+  }
+
   /**
    * Helper to get current calendar date string in YYYY-MM-DD
    */
@@ -803,7 +1013,7 @@ export class AttendanceService {
                       },
                     }
                   );
-                  await mongoose.connection.db.collection('attendances').deleteOne({ _id: doc._id });
+                  // Preserve all documents - never delete records automatically
                   count++;
                 } else {
                   const updateOp: any = {
@@ -1125,18 +1335,15 @@ export class AttendanceService {
 
         await col.updateOne({ _id: primaryDoc._id }, { $set: updateFields });
 
-        if (duplicateIds.length > 0) {
-          const delRes = await col.deleteMany({ _id: { $in: duplicateIds } });
-          deletedCount += delRes.deletedCount || 0;
-        }
+        // Do not delete attendance documents - preserve all raw history and logs
         mergedCount++;
       }
 
       if (mergedCount > 0) {
-        logger.info(`🧹 Merged ${mergedCount} employee duplicate attendance records, deleted ${deletedCount} redundant rows.`);
+        logger.info(`Consolidated ${mergedCount} employee attendance views without deleting any raw documents.`);
       }
 
-      return { mergedCount, deletedCount };
+      return { mergedCount, deletedCount: 0 };
     } catch (err: any) {
       logger.warn('Deduplication note:', err.message);
       return { mergedCount: 0, deletedCount: 0 };
@@ -1203,6 +1410,8 @@ export class AttendanceService {
       const dateOr: any[] = [
         { date: { $in: dateVariants } },
         { date: new RegExp(`^${targetDate}`, 'i') },
+        { loginTime: new RegExp(`^${targetDate}`, 'i') },
+        { punchIn: new RegExp(`^${targetDate}`, 'i') },
       ];
       if (!isNaN(y) && !isNaN(m) && !isNaN(d)) {
         const startOfDayUTC = new Date(Date.UTC(y, m - 1, d, 0, 0, 0) - 5.5 * 3600 * 1000);
@@ -1249,6 +1458,12 @@ export class AttendanceService {
     const [records, totalCountResult, totalStaff, todayStats] = await Promise.all([
       AttendanceModel.aggregate([
         { $match: query },
+        {
+          $project: {
+            selfie: 0,
+            selfieData: 0,
+          },
+        },
         { $sort: { loginTime: -1, punchIn: -1, createdAt: -1 } },
         {
           $group: {
@@ -1259,106 +1474,26 @@ export class AttendanceService {
                 $ifNull: [
                   '$date',
                   {
-                    $dateToString: {
-                      format: '%Y-%m-%d',
-                      date: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
-                      timezone: 'Asia/Kolkata',
-                    },
+                    $substrCP: [
+                      {
+                        $toString: {
+                          $ifNull: ['$loginTime', { $ifNull: ['$punchIn', { $ifNull: ['$createdAt', '1970-01-01'] }] }],
+                        },
+                      },
+                      0,
+                      10,
+                    ],
                   },
                 ],
               },
             },
             doc: { $first: '$$ROOT' },
+            allDocs: { $push: '$$ROOT' },
           },
         },
-        { $replaceRoot: { newRoot: '$doc' } },
-        { $sort: { loginTime: -1, punchIn: -1, createdAt: -1 } },
+        { $sort: { 'doc.loginTime': -1, 'doc.punchIn': -1, 'doc.createdAt': -1 } },
         { $skip: skip },
         { $limit: limit },
-        {
-          $project: {
-            organizationId: 1,
-            userId: 1,
-            employeeId: { $ifNull: ['$employeeId', { $ifNull: ['$empId', 'EMP'] }] },
-            userName: { $ifNull: ['$userName', { $ifNull: ['$empName', { $ifNull: ['$name', 'Employee'] }] }] },
-            empId: { $ifNull: ['$empId', '$employeeId'] },
-            empName: { $ifNull: ['$empName', '$userName'] },
-            userEmail: 1,
-            userPhone: 1,
-            role: 1,
-            department: 1,
-            date: {
-              $ifNull: [
-                '$date',
-                {
-                  $dateToString: {
-                    format: '%Y-%m-%d',
-                    date: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
-                    timezone: 'Asia/Kolkata',
-                  },
-                },
-              ],
-            },
-            loginTime: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
-            lastActiveAt: 1,
-            logoutTime: { $ifNull: ['$logoutTime', '$punchOut'] },
-            punchOut: 1,
-            logoutBy: 1,
-            logoutAdminName: 1,
-            adminLogoutAt: 1,
-            adminLogoutBy: 1,
-            adminLogoutReLoginAt: 1,
-            totalAwayDurationSeconds: 1,
-            awayDurationFormatted: 1,
-            isAwayPending: 1,
-            loginEvents: 1,
-            lunchBreaks: 1,
-            totalLunchDurationSeconds: 1,
-            lunchDurationFormatted: 1,
-            isOnLunch: 1,
-            currentLunchStart: 1,
-            status: 1,
-            location: 1,
-            source: 1,
-            externalRecordId: 1,
-            ipAddress: 1,
-            userAgent: 1,
-            createdAt: 1,
-            updatedAt: 1,
-            workReport: 1,
-            workCategory: 1,
-            developmentChanges: 1,
-            taskSummary: 1,
-            reportSubmittedAt: 1,
-            punchOutImageUrl: 1,
-            logoutLocation: 1,
-            hasSelfie: {
-              $cond: {
-                if: {
-                  $gt: [
-                    {
-                      $strLenCP: {
-                        $substrCP: [
-                          {
-                            $ifNull: [
-                              '$selfieUrl',
-                              { $ifNull: ['$selfie', { $ifNull: ['$selfieData', ''] }] },
-                            ],
-                          },
-                          0,
-                          50,
-                        ],
-                      },
-                    },
-                    20,
-                  ],
-                },
-                then: true,
-                else: false,
-              },
-            },
-          },
-        },
       ], { allowDiskUse: true }),
       AttendanceModel.aggregate([
         { $match: query },
@@ -1371,11 +1506,15 @@ export class AttendanceService {
                 $ifNull: [
                   '$date',
                   {
-                    $dateToString: {
-                      format: '%Y-%m-%d',
-                      date: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
-                      timezone: 'Asia/Kolkata',
-                    },
+                    $substrCP: [
+                      {
+                        $toString: {
+                          $ifNull: ['$loginTime', { $ifNull: ['$punchIn', { $ifNull: ['$createdAt', '1970-01-01'] }] }],
+                        },
+                      },
+                      0,
+                      10,
+                    ],
                   },
                 ],
               },
@@ -1425,10 +1564,26 @@ export class AttendanceService {
     const absentToday = Math.max(0, totalStaff - totalMarked);
     const attendanceRate = totalStaff > 0 ? Math.round((totalMarked / totalStaff) * 100) : 0;
 
-    const sanitizedRecords = records.map((rec: any) => ({
-      ...rec,
-      selfieUrl: rec.hasSelfie ? `/api/v1/attendance/${rec._id}/selfie` : undefined,
-    }));
+    const sanitizedRecords = records.map((groupItem: any) => {
+      const allDocs = Array.isArray(groupItem.allDocs) && groupItem.allDocs.length > 0 ? groupItem.allDocs : [groupItem.doc || groupItem];
+      const merged = mergeAttendanceDocsForDay(allDocs);
+      const rec = merged || groupItem.doc || groupItem;
+      const hasSelfie = Boolean(
+        rec.hasSelfie ||
+        (rec.selfieUrl && rec.selfieUrl.length > 20) ||
+        (rec.selfie && rec.selfie.length > 20) ||
+        (rec.selfieData && rec.selfieData.length > 20) ||
+        allDocs.some((d: any) => (d.selfieUrl && d.selfieUrl.length > 20) || (d.selfie && d.selfie.length > 20) || (d.selfieData && d.selfieData.length > 20))
+      );
+      return {
+        ...rec,
+        employeeId: rec.employeeId || rec.empId || 'EMP',
+        userName: rec.userName || rec.empName || rec.name || 'Employee',
+        empId: rec.empId || rec.employeeId || 'EMP',
+        empName: rec.empName || rec.userName || 'Employee',
+        selfieUrl: hasSelfie ? `/api/v1/attendance/${rec._id}/selfie` : (rec.selfieUrl || undefined),
+      };
+    });
 
     return {
       records: sanitizedRecords as unknown as IAttendance[],
@@ -1575,13 +1730,10 @@ export class AttendanceService {
 
     let record = await AttendanceModel.findOne({ organizationId, userId, date: today });
     if (!record) {
-      const user = await UserModel.findById(userId).lean();
-      if (!user) {
-        throw AppError.notFound('Employee record not found');
-      }
+      const user = await this.findUserFlexible(userId, organizationId);
       record = await AttendanceModel.create({
         organizationId,
-        userId,
+        userId: user._id.toString(),
         employeeId: user.employeeId,
         userName: user.name,
         userEmail: user.email,
@@ -1768,13 +1920,10 @@ export class AttendanceService {
 
     let record = await AttendanceModel.findOne(query);
     if (!record) {
-      const user = await UserModel.findById(userId).lean();
-      if (!user) {
-        throw AppError.notFound('Employee not found');
-      }
+      const user = await this.findUserFlexible(userId, organizationId);
       record = await AttendanceModel.create({
         organizationId: organizationId || user.organizationId || 'org_advmen_platform',
-        userId,
+        userId: user._id.toString(),
         employeeId: user.employeeId,
         userName: user.name,
         userEmail: user.email,
@@ -1839,10 +1988,7 @@ export class AttendanceService {
         : undefined
       : userIdOrMonth;
 
-    const user = await UserModel.findById(effectiveUserId).lean();
-    if (!user) {
-      throw AppError.notFound('Employee profile not found');
-    }
+    const user = await this.findUserFlexible(effectiveUserId, organizationId);
 
     const targetMonth = targetMonthInput || this.getTodayDateString().slice(0, 7);
     const [yearNum, monthNum] = targetMonth.split('-').map(Number);
@@ -1851,9 +1997,26 @@ export class AttendanceService {
     const startDate = `${targetMonth}-01`;
     const endDate = `${targetMonth}-${String(daysInMonth).padStart(2, '0')}`;
 
-    const userConditions: any[] = [{ userId: user._id.toString() }];
+    const userConditions: any[] = [];
+    if (user._id) {
+      userConditions.push({ userId: user._id.toString() });
+    }
+    if (effectiveUserId && effectiveUserId !== user._id.toString()) {
+      userConditions.push({ userId: effectiveUserId });
+      userConditions.push({ employeeId: effectiveUserId });
+    }
     if (user.employeeId) {
-      userConditions.push({ employeeId: user.employeeId });
+      const empEscaped = user.employeeId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const empRegex = new RegExp(`^${empEscaped}$`, 'i');
+      userConditions.push({ employeeId: empRegex });
+      userConditions.push({ empId: empRegex });
+      userConditions.push({ userId: empRegex });
+    }
+    if (user.name) {
+      const nameEscaped = user.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const nameRegex = new RegExp(`^${nameEscaped}$`, 'i');
+      userConditions.push({ userName: nameRegex });
+      userConditions.push({ empName: nameRegex });
     }
 
     const query: Record<string, any> = {
@@ -1868,9 +2031,18 @@ export class AttendanceService {
       .select('-selfieData -selfie -punchOutSelfie')
       .lean();
 
-    const recordByDate = new Map<string, any>();
+    const recordsGroupedByDate = new Map<string, any[]>();
     for (const r of rawRecords) {
-      recordByDate.set(r.date, normalizeAttendanceSessions(r));
+      const d = r.date || (r.loginTime ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(r.loginTime)) : undefined);
+      if (!d) continue;
+      const list = recordsGroupedByDate.get(d) || [];
+      list.push(r);
+      recordsGroupedByDate.set(d, list);
+    }
+
+    const recordByDate = new Map<string, any>();
+    for (const [dStr, docs] of recordsGroupedByDate.entries()) {
+      recordByDate.set(dStr, mergeAttendanceDocsForDay(docs));
     }
 
     const todayDate = this.getTodayDateString();
@@ -2128,26 +2300,42 @@ export class AttendanceService {
         : undefined
       : userIdOrDate;
 
-    const user = await UserModel.findById(effectiveUserId).lean();
-    if (!user) {
-      throw AppError.notFound('Employee profile not found');
-    }
+    const user = await this.findUserFlexible(effectiveUserId, organizationId);
 
     const targetDate = targetDateInput || this.getTodayDateString();
 
+    const userConditions: any[] = [{ userId: user._id.toString() }];
+    if (user.employeeId) {
+      const empEscaped = user.employeeId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const empRegex = new RegExp(`^${empEscaped}$`, 'i');
+      userConditions.push({ employeeId: empRegex });
+      userConditions.push({ empId: empRegex });
+      userConditions.push({ userId: empRegex });
+    }
+    if (effectiveUserId && effectiveUserId !== user._id.toString()) {
+      userConditions.push({ userId: effectiveUserId });
+      userConditions.push({ employeeId: effectiveUserId });
+    }
+    if (user.name) {
+      const nameEscaped = user.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const nameRegex = new RegExp(`^${nameEscaped}$`, 'i');
+      userConditions.push({ userName: nameRegex });
+      userConditions.push({ empName: nameRegex });
+    }
+
     const query: Record<string, any> = {
-      userId: user._id.toString(),
+      $or: userConditions,
       date: targetDate,
     };
     if (organizationId && !isSuperAdmin) {
       query.organizationId = organizationId;
     }
 
-    const attendanceRaw = await AttendanceModel.findOne(query)
+    const rawDocs = await AttendanceModel.find(query)
       .select('-selfieData -selfie -punchOutSelfie')
       .lean();
 
-    const attendance = attendanceRaw ? normalizeAttendanceSessions(attendanceRaw) : null;
+    const attendance = rawDocs.length > 0 ? mergeAttendanceDocsForDay(rawDocs) : null;
 
     const startOfDay = new Date(`${targetDate}T00:00:00+05:30`);
     const endOfDay = new Date(`${targetDate}T23:59:59+05:30`);

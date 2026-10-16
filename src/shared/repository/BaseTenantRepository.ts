@@ -37,7 +37,7 @@ export abstract class BaseTenantRepository<T> {
     return {
       organizationId,
       $or: [
-        { _id: id },
+        { employeeId: id },
         { leadId: id },
         { taskId: id },
       ],
