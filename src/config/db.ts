@@ -37,11 +37,15 @@ export async function connectDB(): Promise<void> {
         await attCol.createIndex({ userId: 1, date: 1 }, { background: true });
         await attCol.createIndex({ userId: 1, date: -1 }, { background: true });
         await attCol.createIndex({ employeeId: 1, date: -1 }, { background: true });
+        await attCol.createIndex({ empId: 1, date: -1 }, { background: true });
+        await attCol.createIndex({ empName: 1 }, { background: true });
+        await attCol.createIndex({ userName: 1 }, { background: true });
         await attCol.createIndex({ organizationId: 1, date: -1, loginTime: -1 }, { background: true });
         await attCol.createIndex({ organizationId: 1, userId: 1, date: 1 }, { background: true });
         await attCol.createIndex({ organizationId: 1, employeeId: 1, date: 1 }, { background: true });
         await attCol.createIndex({ organizationId: 1, date: 1, status: 1 }, { background: true });
         await attCol.createIndex({ loginTime: -1 }, { background: true });
+        await attCol.createIndex({ punchIn: -1 }, { background: true });
         logger.info('⚡ Attendance collection indexes verified and ensured.');
       }
     } catch (idxErr: any) {

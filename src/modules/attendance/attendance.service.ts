@@ -1135,9 +1135,11 @@ export class AttendanceService {
       selectedDate: string;
     };
   }> {
-    if (Date.now() - this.lastSyncTime > 5000 && !this.isSyncing) {
-      await this.syncExternalAttendance(organizationId, false).catch((err) => {
-        logger.warn('External attendance auto-sync note:', err.message);
+    if (Date.now() - this.lastSyncTime > 60000 && !this.isSyncing) {
+      this.lastSyncTime = Date.now();
+      // Run sync non-blocking in background so API responds instantly
+      this.syncExternalAttendance(organizationId, false).catch((err) => {
+        logger.warn('External attendance background sync note:', err.message);
       });
     }
 
@@ -1176,6 +1178,7 @@ export class AttendanceService {
         const endOfDayUTC = new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999) - 5.5 * 3600 * 1000);
         dateOr.push(
           { loginTime: { $gte: startOfDayUTC, $lte: endOfDayUTC } },
+          { punchIn: { $gte: startOfDayUTC, $lte: endOfDayUTC } },
           { createdAt: { $gte: startOfDayUTC, $lte: endOfDayUTC } }
         );
       }
@@ -1193,10 +1196,13 @@ export class AttendanceService {
       andClauses.push({
         $or: [
           { userName: regex },
+          { empName: regex },
+          { name: regex },
           { userEmail: regex },
           { userPhone: regex },
           { department: regex },
           { employeeId: regex },
+          { empId: regex },
         ],
       });
     }
@@ -1212,33 +1218,57 @@ export class AttendanceService {
     const [records, totalCountResult, totalStaff, todayStats] = await Promise.all([
       AttendanceModel.aggregate([
         { $match: query },
-        { $sort: { loginTime: -1 } },
+        { $sort: { loginTime: -1, punchIn: -1, createdAt: -1 } },
         {
           $group: {
             _id: {
               organizationId: '$organizationId',
-              userId: { $ifNull: ['$userId', { $ifNull: ['$employeeId', { $toString: '$_id' }] }] },
-              date: '$date',
+              userId: { $ifNull: ['$userId', { $ifNull: ['$employeeId', { $ifNull: ['$empId', { $toString: '$_id' }] }] }] },
+              date: {
+                $ifNull: [
+                  '$date',
+                  {
+                    $dateToString: {
+                      format: '%Y-%m-%d',
+                      date: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
+                      timezone: 'Asia/Kolkata',
+                    },
+                  },
+                ],
+              },
             },
             doc: { $first: '$$ROOT' },
           },
         },
         { $replaceRoot: { newRoot: '$doc' } },
-        { $sort: { loginTime: -1 } },
+        { $sort: { loginTime: -1, punchIn: -1, createdAt: -1 } },
         { $skip: skip },
         { $limit: limit },
         {
           $project: {
             organizationId: 1,
             userId: 1,
-            employeeId: 1,
-            userName: 1,
+            employeeId: { $ifNull: ['$employeeId', { $ifNull: ['$empId', 'EMP'] }] },
+            userName: { $ifNull: ['$userName', { $ifNull: ['$empName', { $ifNull: ['$name', 'Employee'] }] }] },
+            empId: { $ifNull: ['$empId', '$employeeId'] },
+            empName: { $ifNull: ['$empName', '$userName'] },
             userEmail: 1,
             userPhone: 1,
             role: 1,
             department: 1,
-            date: 1,
-            loginTime: 1,
+            date: {
+              $ifNull: [
+                '$date',
+                {
+                  $dateToString: {
+                    format: '%Y-%m-%d',
+                    date: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
+                    timezone: 'Asia/Kolkata',
+                  },
+                },
+              ],
+            },
+            loginTime: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
             lastActiveAt: 1,
             logoutTime: 1,
             logoutBy: 1,
@@ -1304,8 +1334,19 @@ export class AttendanceService {
           $group: {
             _id: {
               organizationId: '$organizationId',
-              userId: { $ifNull: ['$userId', { $ifNull: ['$employeeId', { $toString: '$_id' }] }] },
-              date: '$date',
+              userId: { $ifNull: ['$userId', { $ifNull: ['$employeeId', { $ifNull: ['$empId', { $toString: '$_id' }] }] }] },
+              date: {
+                $ifNull: [
+                  '$date',
+                  {
+                    $dateToString: {
+                      format: '%Y-%m-%d',
+                      date: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
+                      timezone: 'Asia/Kolkata',
+                    },
+                  },
+                ],
+              },
             },
           },
         },
