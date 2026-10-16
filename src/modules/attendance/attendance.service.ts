@@ -659,26 +659,48 @@ export class AttendanceService {
                 const rawDocUserId = String(doc.userId || (doc.user?._id || doc.user || '')).trim();
                 const rawPhone = String(doc.phone || doc.userPhone || '').replace(/\D/g, '');
 
-                // Match user from users collection
-                let matchedUser = users.find(
-                  (u) =>
-                    (rawDocUserId && u._id.toString() === rawDocUserId) ||
-                    (rawDocUserId && u.employeeId && u.employeeId.toUpperCase() === rawDocUserId.toUpperCase()) ||
-                    (rawEmail && u.email && u.email.toLowerCase() === rawEmail) ||
-                    (rawEmail && (u as any).normalizedEmail && (u as any).normalizedEmail === rawEmail) ||
-                    (rawEmpId && u.employeeId && u.employeeId.toUpperCase() === rawEmpId.toUpperCase()) ||
-                    (rawEmpId && (u as any).empId && (u as any).empId.toUpperCase() === rawEmpId.toUpperCase()) ||
-                    (rawPhone.length >= 7 && u.phone && u.phone.replace(/\D/g, '').slice(-10) === rawPhone.slice(-10)) ||
-                    (rawEmpName && u.name && u.name.trim().toLowerCase() === rawEmpName.toLowerCase())
-                );
+                // Match user from users collection with strict priority
+                let matchedUser: any = undefined;
 
-                // Fuzzy match fallback
-                if (!matchedUser && rawEmpName) {
-                  const cleanTarget = rawEmpName.toLowerCase().replace(/[^a-z0-9]/g, '');
-                  matchedUser = users.find((u) => {
-                    const cleanU = (u.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                    return cleanU && (cleanU === cleanTarget || cleanU.includes(cleanTarget) || cleanTarget.includes(cleanU));
-                  });
+                // 1. Exact employeeId / empId match (highest priority, prevents cross-matching employees with same name)
+                if (rawEmpId) {
+                  matchedUser = users.find(
+                    (u) =>
+                      (u.employeeId && u.employeeId.trim().toUpperCase() === rawEmpId.toUpperCase()) ||
+                      ((u as any).empId && (u as any).empId.trim().toUpperCase() === rawEmpId.toUpperCase())
+                  );
+                }
+
+                // 2. Exact non-generic userId match
+                if (!matchedUser && rawDocUserId && rawDocUserId !== 'EMP' && !rawDocUserId.startsWith('ext_')) {
+                  matchedUser = users.find(
+                    (u) =>
+                      u._id.toString() === rawDocUserId ||
+                      (u.employeeId && u.employeeId.trim().toUpperCase() === rawDocUserId.toUpperCase())
+                  );
+                }
+
+                // 3. Exact email match
+                if (!matchedUser && rawEmail && !rawEmail.includes('@advmen.local')) {
+                  matchedUser = users.find(
+                    (u) =>
+                      (u.email && u.email.toLowerCase() === rawEmail) ||
+                      ((u as any).normalizedEmail && (u as any).normalizedEmail === rawEmail)
+                  );
+                }
+
+                // 4. Exact phone match
+                if (!matchedUser && rawPhone.length >= 7) {
+                  matchedUser = users.find(
+                    (u) => u.phone && u.phone.replace(/\D/g, '').slice(-10) === rawPhone.slice(-10)
+                  );
+                }
+
+                // 5. Match by exact full name ONLY if no employeeId was provided
+                if (!matchedUser && rawEmpName && !rawEmpId) {
+                  matchedUser = users.find(
+                    (u) => u.name && u.name.trim().toLowerCase() === rawEmpName.toLowerCase()
+                  );
                 }
 
                 const userOrgId = matchedUser?.organizationId || doc.organizationId || targetOrgId;
@@ -721,6 +743,7 @@ export class AttendanceService {
 
                 if (finalLogout) {
                   updateFields.logoutTime = finalLogout;
+                  updateFields.punchOut = finalLogout;
                 }
 
                 if (typeof doc.imageUrl === 'string' && doc.imageUrl.trim()) {
@@ -741,6 +764,14 @@ export class AttendanceService {
                 }
                 if (doc.logoutLocation) updateFields.logoutLocation = doc.logoutLocation;
                 if (doc.location) updateFields.location = doc.location;
+
+                if (doc.lunchBreaks && Array.isArray(doc.lunchBreaks) && doc.lunchBreaks.length > 0) {
+                  updateFields.lunchBreaks = doc.lunchBreaks;
+                }
+                if (doc.isOnLunch !== undefined) updateFields.isOnLunch = Boolean(doc.isOnLunch);
+                if (doc.lunchDuration !== undefined) updateFields.totalLunchDurationSeconds = (doc.lunchDuration || 0) * 60;
+                if (doc.lunchDurationFormatted) updateFields.lunchDurationFormatted = doc.lunchDurationFormatted;
+                if (doc.lunchStartTime) updateFields.currentLunchStart = toValidAttendanceDate(doc.lunchStartTime, dateStr);
 
                 // Check for existing record to merge into
                 const existing = await mongoose.connection.db.collection('attendances').findOne({
@@ -994,7 +1025,7 @@ export class AttendanceService {
           $group: {
             _id: {
               organizationId: '$organizationId',
-              userId: '$userId',
+              userKey: { $ifNull: ['$employeeId', { $ifNull: ['$userId', { $ifNull: ['$empId', '$_id'] }] }] },
               date: '$date',
             },
             count: { $sum: 1 },
@@ -1223,7 +1254,7 @@ export class AttendanceService {
           $group: {
             _id: {
               organizationId: '$organizationId',
-              userId: { $ifNull: ['$userId', { $ifNull: ['$employeeId', { $ifNull: ['$empId', { $toString: '$_id' }] }] }] },
+              userId: { $ifNull: ['$employeeId', { $ifNull: ['$userId', { $ifNull: ['$empId', { $toString: '$_id' }] }] }] },
               date: {
                 $ifNull: [
                   '$date',
@@ -1270,7 +1301,8 @@ export class AttendanceService {
             },
             loginTime: { $ifNull: ['$loginTime', { $ifNull: ['$punchIn', '$createdAt'] }] },
             lastActiveAt: 1,
-            logoutTime: 1,
+            logoutTime: { $ifNull: ['$logoutTime', '$punchOut'] },
+            punchOut: 1,
             logoutBy: 1,
             logoutAdminName: 1,
             adminLogoutAt: 1,
@@ -1334,7 +1366,7 @@ export class AttendanceService {
           $group: {
             _id: {
               organizationId: '$organizationId',
-              userId: { $ifNull: ['$userId', { $ifNull: ['$employeeId', { $ifNull: ['$empId', { $toString: '$_id' }] }] }] },
+              userId: { $ifNull: ['$employeeId', { $ifNull: ['$userId', { $ifNull: ['$empId', { $toString: '$_id' }] }] }] },
               date: {
                 $ifNull: [
                   '$date',
