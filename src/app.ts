@@ -17,7 +17,8 @@ export function createApp(): Express {
   const app: Express = express();
 
   // 1. Core Security & Request Parsing Middlewares
-  app.use(helmet());
+  // Allow cross-origin <img> loading (frontend on a different port/domain loads selfie images from this API)
+  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(
     cors({
       origin: (origin, callback) => {

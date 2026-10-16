@@ -13,6 +13,11 @@ async function bootstrap() {
   // 2. Automatically Seed Production & Demo Initial Records
   await seedDatabase().catch((err) => logger.warn('⚠️ Seeding note:', err.message));
 
+  // 2.1 Clean up duplicate attendance records in background
+  import('./modules/attendance/attendance.service.js')
+    .then(({ attendanceService }) => attendanceService.deduplicateAttendanceRecords())
+    .catch((err) => logger.warn('Attendance deduplication init note:', err.message));
+
   // 3. Initialize Express Application & HTTP Server
   const app = createApp();
   const server = http.createServer(app);
@@ -32,7 +37,7 @@ async function bootstrap() {
     }
   });
 
-  server.listen(env.PORT, () => {
+  server.listen(env.PORT, '0.0.0.0', () => {
     logger.info(`🚀 ${env.APP_NAME} Backend running on port ${env.PORT} [${env.NODE_ENV}]`);
     logger.info(`🔗 Health Check: http://localhost:${env.PORT}/health/live`);
     logger.info(`🔗 API v1 Base: http://localhost:${env.PORT}/api/v1`);

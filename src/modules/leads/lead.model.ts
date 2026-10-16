@@ -289,6 +289,7 @@ const LeadSchema = new Schema<ILead>(
 
 // Critical compound indexes specified in PDF Section 16
 LeadSchema.index({ organizationId: 1, createdAt: -1 });
+LeadSchema.index({ organizationId: 1, ownerId: 1 });
 LeadSchema.index({ organizationId: 1, ownerId: 1, status: 1 });
 LeadSchema.index({ organizationId: 1, normalizedPhone: 1 });
 LeadSchema.index({ organizationId: 1, normalizedEmail: 1 });

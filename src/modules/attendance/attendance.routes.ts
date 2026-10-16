@@ -4,6 +4,11 @@ import { authMiddleware } from '../../middleware/auth.middleware.js';
 
 export const attendanceRouter = Router();
 
+attendanceRouter.get('/debug/sample', attendanceController.getSampleDebug);
+attendanceRouter.get('/debug/dedup', attendanceController.triggerDedupDebug);
+
+// Public on-demand streaming route for employee check-in selfies (enables browser caching and <img> tags)
+attendanceRouter.get('/:id/selfie', attendanceController.getSelfieImage);
 
 attendanceRouter.use(authMiddleware);
 
@@ -12,6 +17,16 @@ attendanceRouter.get('/my', attendanceController.getMyAttendance);
 
 // Employee route: punch out
 attendanceRouter.post('/punch-out', attendanceController.punchOut);
+
+// Employee / Admin route: lunch break management
+attendanceRouter.post('/lunch/start', attendanceController.startLunch);
+attendanceRouter.post('/lunch/end', attendanceController.endLunch);
+attendanceRouter.get('/lunch/status', attendanceController.getLunchStatus);
+
+// Employee / Admin route: detailed monthly day-wise and lunch history for employee
+attendanceRouter.get('/employee/:userId/history', attendanceController.getEmployeeMonthlyHistory);
+attendanceRouter.get('/employee/:userId/daily-report', attendanceController.getEmployeeDailyReport);
+attendanceRouter.post('/employee/:userId/lunch', attendanceController.adminRecordLunch);
 
 // Administrator route: view employee attendance and login history
 attendanceRouter.get('/', attendanceController.getAttendanceList);

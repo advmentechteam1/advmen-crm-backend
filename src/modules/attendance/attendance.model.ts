@@ -4,6 +4,15 @@ export type AttendanceStatus = 'PRESENT' | 'LATE' | 'HALF_DAY' | 'ON_LEAVE';
 
 export type LogoutActor = 'ADMIN' | 'EMPLOYEE' | 'SYSTEM';
 
+export interface IAttendanceLunchBreak {
+  startTime: Date;
+  endTime?: Date;
+  durationSeconds?: number;
+  durationFormatted?: string;
+  notes?: string;
+  status: 'ONGOING' | 'COMPLETED';
+}
+
 export interface IAttendanceLoginEvent {
   loginTime: Date;
   logoutTime?: Date;
@@ -38,8 +47,15 @@ export interface IAttendance extends Document {
   awayDurationFormatted?: string;
   isAwayPending?: boolean;
   loginEvents: IAttendanceLoginEvent[];
+  lunchBreaks: IAttendanceLunchBreak[];
+  totalLunchDurationSeconds?: number;
+  lunchDurationFormatted?: string;
+  isOnLunch?: boolean;
+  currentLunchStart?: Date;
   status: AttendanceStatus;
   selfieUrl?: string;
+  selfieData?: string;
+  selfie?: string;
   location?: {
     address?: string;
     lat?: number;
@@ -52,9 +68,37 @@ export interface IAttendance extends Document {
   ipAddress?: string;
   userAgent?: string;
   notes?: string;
+  workReport?: string;
+  workCategory?: string;
+  developmentChanges?: string;
+  taskSummary?: string;
+  reportSubmittedAt?: Date;
+  punchOutImageUrl?: string;
+  punchOutSelfie?: string;
+  shiftDurationSeconds?: number;
+  shiftDurationFormatted?: string;
+  logoutLocation?: {
+    address?: string;
+    lat?: number;
+    lng?: number;
+    accuracy?: number;
+    googleMapsUrl?: string;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
+
+const AttendanceLunchBreakSchema = new Schema<IAttendanceLunchBreak>(
+  {
+    startTime: { type: Date, required: true },
+    endTime: { type: Date },
+    durationSeconds: { type: Number, default: 0 },
+    durationFormatted: { type: String, trim: true },
+    notes: { type: String, trim: true },
+    status: { type: String, enum: ['ONGOING', 'COMPLETED'], default: 'ONGOING' },
+  },
+  { _id: false }
+);
 
 const AttendanceLoginEventSchema = new Schema<IAttendanceLoginEvent>(
   {
@@ -118,16 +162,16 @@ const AttendanceSchema = new Schema<IAttendance>(
       index: true,
     },
     loginTime: {
-      type: Date,
+      type: Schema.Types.Mixed,
       default: Date.now,
       required: true,
     },
     lastActiveAt: {
-      type: Date,
+      type: Schema.Types.Mixed,
       default: Date.now,
     },
     logoutTime: {
-      type: Date,
+      type: Schema.Types.Mixed,
     },
     logoutBy: {
       type: String,
@@ -163,6 +207,25 @@ const AttendanceSchema = new Schema<IAttendance>(
       type: [AttendanceLoginEventSchema],
       default: [],
     },
+    lunchBreaks: {
+      type: [AttendanceLunchBreakSchema],
+      default: [],
+    },
+    totalLunchDurationSeconds: {
+      type: Number,
+      default: 0,
+    },
+    lunchDurationFormatted: {
+      type: String,
+      trim: true,
+    },
+    isOnLunch: {
+      type: Boolean,
+      default: false,
+    },
+    currentLunchStart: {
+      type: Date,
+    },
     status: {
       type: String,
       enum: ['PRESENT', 'LATE', 'HALF_DAY', 'ON_LEAVE'],
@@ -171,6 +234,14 @@ const AttendanceSchema = new Schema<IAttendance>(
     selfieUrl: {
       type: String,
       trim: true,
+    },
+    selfieData: {
+      type: String,
+      select: false,
+    },
+    selfie: {
+      type: String,
+      select: false,
     },
     location: {
       address: { type: String, trim: true },
@@ -187,7 +258,6 @@ const AttendanceSchema = new Schema<IAttendance>(
     externalRecordId: {
       type: String,
       trim: true,
-      index: true,
     },
     ipAddress: {
       type: String,
@@ -198,15 +268,65 @@ const AttendanceSchema = new Schema<IAttendance>(
     notes: {
       type: String,
     },
+    workReport: {
+      type: String,
+      trim: true,
+    },
+    workCategory: {
+      type: String,
+      trim: true,
+    },
+    developmentChanges: {
+      type: String,
+      trim: true,
+    },
+    taskSummary: {
+      type: String,
+      trim: true,
+    },
+    reportSubmittedAt: {
+      type: Date,
+    },
+    punchOutImageUrl: {
+      type: String,
+      trim: true,
+    },
+    punchOutSelfie: {
+      type: String,
+      select: false,
+    },
+    shiftDurationSeconds: {
+      type: Number,
+      default: 0,
+    },
+    shiftDurationFormatted: {
+      type: String,
+      trim: true,
+    },
+    logoutLocation: {
+      address: { type: String, trim: true },
+      lat: { type: Number },
+      lng: { type: Number },
+      accuracy: { type: Number },
+      googleMapsUrl: { type: String, trim: true },
+    },
   },
   {
     timestamps: true,
   }
 );
 
-// Index for fast tenant employee date queries
+// Ultra-fast query & sort indexes matching tenant date and employee filters
+AttendanceSchema.index({ date: -1 });
+AttendanceSchema.index({ userId: 1, date: 1 });
+AttendanceSchema.index({ userId: 1, date: -1 });
+AttendanceSchema.index({ employeeId: 1, date: -1 });
+AttendanceSchema.index({ organizationId: 1, date: -1, loginTime: -1 });
 AttendanceSchema.index({ organizationId: 1, userId: 1, date: 1 });
+AttendanceSchema.index({ organizationId: 1, userId: 1, date: -1 });
+AttendanceSchema.index({ organizationId: 1, employeeId: 1, date: 1 });
 AttendanceSchema.index({ organizationId: 1, date: 1, status: 1 });
-AttendanceSchema.index({ organizationId: 1, loginTime: -1 });
+AttendanceSchema.index({ loginTime: -1 });
+AttendanceSchema.index({ externalRecordId: 1 });
 
 export const AttendanceModel = mongoose.model<IAttendance>('Attendance', AttendanceSchema);

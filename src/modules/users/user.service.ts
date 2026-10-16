@@ -29,22 +29,25 @@ export class UserService {
     const result = await userRepository.findUsers(requester.organizationId, filter, isSuperAdmin);
 
     // Aggregate lead counts per user within organization
-    const userIds = result.users.map((u) => (u._id ? u._id.toString() : u.id));
-    const leadCounts = await LeadModel.aggregate([
-      {
-        $match: {
-          organizationId: requester.organizationId,
-          ownerId: { $in: userIds },
+    const userIds = result.users.map((u) => (u._id ? u._id.toString() : u.id)).filter(Boolean);
+    let leadCountMap = new Map<string, number>();
+    if (userIds.length > 0) {
+      const leadCounts = await LeadModel.aggregate([
+        {
+          $match: {
+            organizationId: requester.organizationId,
+            ownerId: { $in: userIds },
+          },
         },
-      },
-      {
-        $group: {
-          _id: '$ownerId',
-          count: { $sum: 1 },
+        {
+          $group: {
+            _id: '$ownerId',
+            count: { $sum: 1 },
+          },
         },
-      },
-    ]);
-    const leadCountMap = new Map<string, number>(leadCounts.map((lc) => [String(lc._id), lc.count]));
+      ]);
+      leadCountMap = new Map<string, number>(leadCounts.map((lc) => [String(lc._id), lc.count]));
+    }
 
     return {
       users: result.users.map((u) => {
@@ -113,39 +116,19 @@ export class UserService {
     
     let employeeId: string | undefined = undefined;
     if (role !== USER_ROLES.SUPER_ADMIN) {
-      // 1. Attempt to register directly on external Attendance App so employee can immediately login there
-      try {
-        const extSignup = await fetch('https://atendence-crm.vercel.app/api/auth/signup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: input.name.trim(),
-            email: input.email.trim().toLowerCase(),
-            password: input.password,
-          }),
-          signal: AbortSignal.timeout(6000),
-        });
+      // 1. Non-blocking fire-and-forget signup notification to external app (shared DB already stores user)
+      fetch('https://atendence-crm.vercel.app/api/auth/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: input.name.trim(),
+          email: input.email.trim().toLowerCase(),
+          password: input.password,
+        }),
+        signal: AbortSignal.timeout(1500),
+      }).catch(() => {});
 
-        if (extSignup.ok) {
-          const extJson = (await extSignup.json()) as any;
-          if (extJson && extJson.success && extJson.empId) {
-            employeeId = extJson.empId;
-            logger.info(`✅ Employee synced to Attendance CRM with ID: ${employeeId}`);
-          }
-        }
-      } catch (extErr: any) {
-        logger.warn('Attendance CRM employee signup note:', extErr.message);
-      }
-
-      // Check if employeeId from external is already taken in our DB
-      if (employeeId) {
-        const existingUserWithId = await UserModel.findOne({ employeeId });
-        if (existingUserWithId) {
-          employeeId = await this.generateEmployeeId();
-        }
-      } else {
-        employeeId = await this.generateEmployeeId();
-      }
+      employeeId = await this.generateEmployeeId();
     }
 
     // 5. Create user in database with robust retry on employeeId collision
@@ -231,44 +214,40 @@ export class UserService {
   private async generateEmployeeId(): Promise<string> {
     const year = new Date().getFullYear();
     try {
-      for (let attempts = 0; attempts < 25; attempts++) {
-        const counter = await EmployeeCounterModel.findOneAndUpdate(
-          { _id: `employee-${year}` },
-          { $inc: { sequence: 1 }, $setOnInsert: { _id: `employee-${year}` } },
-          { new: true, upsert: true }
-        );
+      const counter = await EmployeeCounterModel.findOneAndUpdate(
+        { _id: `employee-${year}` },
+        { $inc: { sequence: 1 }, $setOnInsert: { _id: `employee-${year}` } },
+        { new: true, upsert: true }
+      );
 
-        if (counter && counter.sequence) {
-          const candidate = `EMP-${year}-${String(counter.sequence).padStart(4, '0')}`;
-          const exists = await UserModel.findOne({ employeeId: candidate });
-          if (!exists) {
-            return candidate;
+      if (counter && counter.sequence) {
+        let seq = counter.sequence;
+        const candidate = `EMP-${year}-${String(seq).padStart(4, '0')}`;
+        const exists = await UserModel.findOne({ employeeId: candidate }).select('_id').lean();
+        if (!exists) {
+          return candidate;
+        }
+
+        // If candidate was already taken by legacy manual insertion, synchronize to highest + 1
+        const highestUser = await UserModel.findOne({
+          employeeId: new RegExp(`^EMP-${year}-\\d+$`),
+        })
+          .sort({ employeeId: -1 })
+          .select('employeeId')
+          .lean();
+
+        if (highestUser?.employeeId) {
+          const parts = highestUser.employeeId.split('-');
+          const lastSeq = parseInt(parts[parts.length - 1], 10);
+          if (!isNaN(lastSeq)) {
+            seq = lastSeq + 1;
+            await EmployeeCounterModel.updateOne({ _id: `employee-${year}` }, { $set: { sequence: seq } });
+            return `EMP-${year}-${String(seq).padStart(4, '0')}`;
           }
         }
       }
     } catch (counterErr: any) {
       logger.warn('Atomic counter lookup note:', counterErr?.message);
-    }
-
-    // Direct highest sequence scan from UserModel
-    try {
-      const highestUser = await UserModel.findOne({
-        employeeId: new RegExp(`^EMP-${year}-\\d+$`),
-      }).sort({ employeeId: -1 });
-
-      if (highestUser && highestUser.employeeId) {
-        const parts = highestUser.employeeId.split('-');
-        const lastSeq = parseInt(parts[parts.length - 1], 10);
-        if (!isNaN(lastSeq)) {
-          const candidate = `EMP-${year}-${String(lastSeq + 1).padStart(4, '0')}`;
-          const exists = await UserModel.findOne({ employeeId: candidate });
-          if (!exists) {
-            return candidate;
-          }
-        }
-      }
-    } catch (scanErr: any) {
-      logger.warn('UserModel scan lookup note:', scanErr?.message);
     }
 
     // Guaranteed collision-free fallback

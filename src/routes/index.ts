@@ -19,6 +19,8 @@ import { departmentRouter } from '../modules/departments/department.routes.js';
 export const apiRouter = Router();
 
 // Root API v1 Information
+apiRouter.use('/health', healthRouter);
+
 apiRouter.get('/', (_req: Request, res: Response) => {
   res.json({
     app: 'ADVMEN SalesOS API',

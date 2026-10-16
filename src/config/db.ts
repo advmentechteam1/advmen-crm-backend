@@ -13,8 +13,9 @@ export async function connectDB(): Promise<void> {
 
   const mongooseOptions: ConnectOptions = {
     autoIndex: true, // Create compound indexes on boot
-    serverSelectionTimeoutMS: 10000, // 10s timeout for Atlas cluster discovery
+    serverSelectionTimeoutMS: 15000, // 15s timeout for Atlas cluster discovery
     socketTimeoutMS: 45000,
+    connectTimeoutMS: 30000,
     maxPoolSize: 50,
     minPoolSize: 5,
     retryWrites: true,
@@ -28,20 +29,23 @@ export async function connectDB(): Promise<void> {
     const dbType = isAtlas ? 'MongoDB Atlas Cluster' : 'MongoDB';
     logger.info(`✅ ${dbType} Connected Successfully: ${conn.connection.host}/${conn.connection.name}`);
 
-    // Drop legacy rogue indexes on users collection that cause duplicate null key collisions
+    // Ensure all critical indexes on attendances collection are built
     try {
-      const usersCol = conn.connection.db?.collection('users');
-      if (usersCol) {
-        const existingIndexes = await usersCol.indexes();
-        for (const idx of existingIndexes) {
-          if (idx.name && (idx.name === 'empId_1' || (idx.key && (idx.key as any).empId))) {
-            logger.info(`🧹 Dropping legacy rogue index: ${idx.name}`);
-            await usersCol.dropIndex(idx.name).catch(() => {});
-          }
-        }
+      const attCol = conn.connection.db?.collection('attendances');
+      if (attCol) {
+        await attCol.createIndex({ date: -1 }, { background: true });
+        await attCol.createIndex({ userId: 1, date: 1 }, { background: true });
+        await attCol.createIndex({ userId: 1, date: -1 }, { background: true });
+        await attCol.createIndex({ employeeId: 1, date: -1 }, { background: true });
+        await attCol.createIndex({ organizationId: 1, date: -1, loginTime: -1 }, { background: true });
+        await attCol.createIndex({ organizationId: 1, userId: 1, date: 1 }, { background: true });
+        await attCol.createIndex({ organizationId: 1, employeeId: 1, date: 1 }, { background: true });
+        await attCol.createIndex({ organizationId: 1, date: 1, status: 1 }, { background: true });
+        await attCol.createIndex({ loginTime: -1 }, { background: true });
+        logger.info('⚡ Attendance collection indexes verified and ensured.');
       }
-    } catch {
-      // Safe to ignore if collection doesn't exist yet
+    } catch (idxErr: any) {
+      logger.warn('Index initialization note:', idxErr.message);
     }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
