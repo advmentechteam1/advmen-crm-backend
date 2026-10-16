@@ -15,6 +15,9 @@ attendanceRouter.use(authMiddleware);
 // Employee route: get own attendance history
 attendanceRouter.get('/my', attendanceController.getMyAttendance);
 
+// Employee route: punch in (with selfie & geolocation)
+attendanceRouter.post('/punch-in', attendanceController.punchIn);
+
 // Employee route: punch out
 attendanceRouter.post('/punch-out', attendanceController.punchOut);
 

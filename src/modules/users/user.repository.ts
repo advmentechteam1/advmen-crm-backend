@@ -1,4 +1,5 @@
 import { UserModel, IUser } from '../auth/auth.model.js';
+import { SuperAdminModel } from '../auth/superAdmin.model.js';
 import { UserFilterQuery } from './user.validators.js';
 
 export class UserRepository {
@@ -20,6 +21,8 @@ export class UserRepository {
 
     if (filter.role) {
       query.role = filter.role;
+    } else {
+      query.role = { $ne: 'SUPER_ADMIN' };
     }
 
     if (filter.isActive !== undefined) {
@@ -57,14 +60,27 @@ export class UserRepository {
     if (!isSuperAdmin) {
       query.organizationId = organizationId;
     }
-    return UserModel.findOne(query);
+    const user = await UserModel.findOne(query);
+    if (user) return user;
+
+    if (isSuperAdmin) {
+      const sa = await SuperAdminModel.findById(id);
+      if (sa) return sa as unknown as IUser;
+    }
+    return null;
   }
 
   async findByNormalizedEmail(email: string): Promise<IUser | null> {
+    const sa = await SuperAdminModel.findOne({ normalizedEmail: email.toLowerCase() });
+    if (sa) return sa as unknown as IUser;
     return UserModel.findOne({ normalizedEmail: email.toLowerCase() });
   }
 
   async create(userData: Partial<IUser>): Promise<IUser> {
+    if (userData.role === 'SUPER_ADMIN') {
+      const sa = await SuperAdminModel.create(userData as any);
+      return sa as unknown as IUser;
+    }
     return UserModel.create(userData);
   }
 
@@ -74,6 +90,12 @@ export class UserRepository {
     updateData: Partial<IUser>,
     isSuperAdmin: boolean = false
   ): Promise<IUser | null> {
+    const isSA = await SuperAdminModel.exists({ _id: id });
+    if (isSA) {
+      const sa = await SuperAdminModel.findByIdAndUpdate(id, { $set: updateData }, { new: true });
+      return sa as unknown as IUser;
+    }
+
     const query: Record<string, any> = { _id: id };
     if (!isSuperAdmin) {
       query.organizationId = organizationId;
@@ -86,6 +108,12 @@ export class UserRepository {
     id: string,
     isSuperAdmin: boolean = false
   ): Promise<boolean> {
+    const isSA = await SuperAdminModel.exists({ _id: id });
+    if (isSA) {
+      const saRes = await SuperAdminModel.deleteOne({ _id: id });
+      return (saRes.deletedCount ?? 0) > 0;
+    }
+
     const query: Record<string, any> = { _id: id };
     if (!isSuperAdmin) {
       query.organizationId = organizationId;

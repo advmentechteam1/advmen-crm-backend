@@ -51,6 +51,39 @@ export class AttendanceController {
   }
 
   /**
+   * POST /api/v1/attendance/punch-in
+   * Logged-in employee recording explicit punch in (with selfie & geolocation)
+   */
+  async punchIn(req: Request, res: Response): Promise<void> {
+    const user = (req as any).user as AuthenticatedUser;
+    const { selfieUrl, selfie, selfieData, location, notes } = req.body || {};
+
+    const record = await attendanceService.recordPunchIn({
+      userId: user.id,
+      organizationId: user.organizationId || 'org_advmen_platform',
+      employeeId: user.employeeId,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      role: user.role,
+      department: user.department,
+      selfieUrl,
+      selfie,
+      selfieData,
+      location,
+      notes,
+      ipAddress: (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress,
+      userAgent: req.headers['user-agent'],
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Punch-in recorded successfully',
+      record,
+    });
+  }
+
+  /**
    * POST /api/v1/attendance/punch-out
    * Logged-in employee recording punch out
    */

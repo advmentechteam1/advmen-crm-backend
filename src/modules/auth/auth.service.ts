@@ -12,6 +12,7 @@ import { normalizeEmail } from '../../shared/utils/normalize.js';
 import { authRepository } from './auth.repository.js';
 import { OrganizationModel } from '../organizations/organization.model.js';
 import { IUser, UserModel } from './auth.model.js';
+import { SuperAdminModel } from './superAdmin.model.js';
 import { attendanceService } from '../attendance/attendance.service.js';
 import { logger } from '../../shared/logger/logger.js';
 import { emitTenantEvent } from '../../config/socket.js';
@@ -503,10 +504,16 @@ export class AuthService {
 
     // Store HASHED otp — never persist plain text
     const hashedOtp = crypto.createHash('sha256').update(otp).digest('hex');
-    await UserModel.updateOne(
-      { _id: user._id },
-      { $set: { passwordResetToken: hashedOtp, passwordResetExpiresAt: expiresAt } }
-    );
+    await Promise.all([
+      SuperAdminModel.updateOne(
+        { _id: user._id },
+        { $set: { passwordResetToken: hashedOtp, passwordResetExpiresAt: expiresAt } }
+      ),
+      UserModel.updateOne(
+        { _id: user._id },
+        { $set: { passwordResetToken: hashedOtp, passwordResetExpiresAt: expiresAt } }
+      ),
+    ]);
 
     // Send the OTP to the Super Admin's email
     await emailService.sendPasswordResetOtp(user.email, otp, user.name);
@@ -524,10 +531,17 @@ export class AuthService {
   async resetPassword(otp: string, newPassword: string): Promise<void> {
     const hashedOtp = crypto.createHash('sha256').update(otp).digest('hex');
 
-    const user = await UserModel.findOne({
+    let user: any = await SuperAdminModel.findOne({
       passwordResetToken: hashedOtp,
       passwordResetExpiresAt: { $gt: new Date() },
     }).select('+passwordHash +passwordResetToken +passwordResetExpiresAt');
+
+    if (!user) {
+      user = await UserModel.findOne({
+        passwordResetToken: hashedOtp,
+        passwordResetExpiresAt: { $gt: new Date() },
+      }).select('+passwordHash +passwordResetToken +passwordResetExpiresAt');
+    }
 
     if (!user) {
       throw AppError.unauthorized('The OTP is incorrect or has expired. Please request a new one.');

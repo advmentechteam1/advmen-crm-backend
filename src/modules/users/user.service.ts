@@ -116,19 +116,28 @@ export class UserService {
     
     let employeeId: string | undefined = undefined;
     if (role !== USER_ROLES.SUPER_ADMIN) {
-      // 1. Non-blocking fire-and-forget signup notification to external app (shared DB already stores user)
-      fetch('https://atendence-crm.vercel.app/api/auth/signup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: input.name.trim(),
-          email: input.email.trim().toLowerCase(),
-          password: input.password,
-        }),
-        signal: AbortSignal.timeout(1500),
-      }).catch(() => {});
-
       employeeId = await this.generateEmployeeId();
+
+      // Non-blocking fire-and-forget signup notification to external attendance app
+      const extSignupPayload = {
+        name: input.name.trim(),
+        email: input.email.trim().toLowerCase(),
+        password: input.password,
+        employeeId,
+        empId: employeeId,
+        phone: input.phone?.trim() || '',
+        department: input.department?.trim() || 'General Sales',
+        role,
+      };
+
+      Promise.allSettled([
+        fetch('https://atendence-crm.vercel.app/api/auth/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(extSignupPayload),
+          signal: AbortSignal.timeout(8000),
+        }),
+      ]).catch(() => {});
     }
 
     // 5. Create user in database with robust retry on employeeId collision

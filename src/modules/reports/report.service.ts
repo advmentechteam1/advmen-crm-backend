@@ -80,53 +80,81 @@ export class ReportService {
       let syncedCount = 0;
 
       for (const att of attendances) {
-        if (!att.workReport && !att.workCategory) continue;
+        try {
+          if (!att.workReport && !att.workCategory) continue;
 
-        const dateStr = att.date;
-        const orgId = att.organizationId || targetOrgId || 'org_default';
-        const userId = att.userId?.toString() || att.employeeId || (att as any).empId || att._id.toString();
+          let dateStr = att.date ? String(att.date).trim() : '';
+          if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+            const fallbackDateObj = att.loginTime
+              ? new Date(att.loginTime)
+              : att.reportSubmittedAt
+              ? new Date(att.reportSubmittedAt)
+              : att.createdAt
+              ? new Date(att.createdAt)
+              : new Date();
 
-        // Upsert by organizationId + userId + date
-        const existing = await ReportModel.findOne({
-          $or: [
-            { organizationId: orgId, userId, date: dateStr },
-            { date: dateStr, employeeId: att.employeeId || (att as any).empId },
-          ],
-        });
+            dateStr = !isNaN(fallbackDateObj.getTime())
+              ? new Intl.DateTimeFormat('en-CA', {
+                  timeZone: 'Asia/Kolkata',
+                  year: 'numeric',
+                  month: '2-digit',
+                  day: '2-digit',
+                }).format(fallbackDateObj)
+              : new Intl.DateTimeFormat('en-CA', {
+                  timeZone: 'Asia/Kolkata',
+                  year: 'numeric',
+                  month: '2-digit',
+                  day: '2-digit',
+                }).format(new Date());
+          }
 
-        const updateData: any = {
-          organizationId: orgId,
-          userId,
-          employeeId: att.employeeId || (att as any).empId || 'EMP',
-          userName: att.userName || (att as any).empName || (att as any).name || 'Employee',
-          userEmail: att.userEmail || (att as any).email || '',
-          userPhone: att.userPhone || (att as any).phone || '',
-          department: att.department || 'Sales & Business Development',
-          role: att.role || 'SALES_REP',
-          date: dateStr,
-          workCategory: att.workCategory || 'General Work',
-          workReport: att.workReport || 'Report recorded during punch-out.',
-          developmentChanges: att.developmentChanges || '',
-          taskSummary: att.taskSummary || '',
-          punchInTime: att.loginTime,
-          punchOutTime: att.logoutTime,
-          shiftDurationSeconds: att.shiftDurationSeconds || 0,
-          shiftDurationFormatted: att.shiftDurationFormatted || '-',
-          selfieUrl: att.selfieUrl,
-          punchOutImageUrl: att.punchOutImageUrl,
-          location: att.location,
-          logoutLocation: att.logoutLocation,
-          submittedAt: att.reportSubmittedAt || att.logoutTime || att.createdAt || new Date(),
-          source: 'ATTENDANCE_PUNCHOUT',
-          status: 'SUBMITTED',
-        };
+          const orgId = att.organizationId || targetOrgId || 'org_default';
+          const userId = att.userId?.toString() || att.employeeId || (att as any).empId || att._id.toString();
 
-        if (existing) {
-          await ReportModel.updateOne({ _id: existing._id }, { $set: updateData });
-        } else {
-          await ReportModel.create(updateData);
+          // Upsert by organizationId + userId + date
+          const existing = await ReportModel.findOne({
+            $or: [
+              { organizationId: orgId, userId, date: dateStr },
+              { date: dateStr, employeeId: att.employeeId || (att as any).empId },
+            ],
+          });
+
+          const updateData: any = {
+            organizationId: orgId,
+            userId,
+            employeeId: att.employeeId || (att as any).empId || 'EMP',
+            userName: att.userName || (att as any).empName || (att as any).name || 'Employee',
+            userEmail: att.userEmail || (att as any).email || '',
+            userPhone: att.userPhone || (att as any).phone || '',
+            department: att.department || 'Sales & Business Development',
+            role: att.role || 'SALES_REP',
+            date: dateStr,
+            workCategory: att.workCategory || 'General Work',
+            workReport: att.workReport || 'Report recorded during punch-out.',
+            developmentChanges: att.developmentChanges || '',
+            taskSummary: att.taskSummary || '',
+            punchInTime: att.loginTime,
+            punchOutTime: att.logoutTime,
+            shiftDurationSeconds: att.shiftDurationSeconds || 0,
+            shiftDurationFormatted: att.shiftDurationFormatted || '-',
+            selfieUrl: att.selfieUrl,
+            punchOutImageUrl: att.punchOutImageUrl,
+            location: att.location,
+            logoutLocation: att.logoutLocation,
+            submittedAt: att.reportSubmittedAt || att.logoutTime || att.createdAt || new Date(),
+            source: 'ATTENDANCE_PUNCHOUT',
+            status: 'SUBMITTED',
+          };
+
+          if (existing) {
+            await ReportModel.updateOne({ _id: existing._id }, { $set: updateData });
+          } else {
+            await ReportModel.create(updateData);
+          }
+          syncedCount++;
+        } catch (itemErr: any) {
+          logger.warn(`Single report sync warning for record ${att._id}: ${itemErr.message}`);
         }
-        syncedCount++;
       }
 
       logger.info(`✅ Synchronized ${syncedCount} work reports into 'reports' collection.`);

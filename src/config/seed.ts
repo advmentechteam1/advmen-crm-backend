@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import { connectDB, disconnectDB } from './db.js';
 import { OrganizationModel } from '../modules/organizations/organization.model.js';
 import { UserModel } from '../modules/auth/auth.model.js';
+import { SuperAdminModel } from '../modules/auth/superAdmin.model.js';
 import { EmployeeCounterModel } from '../modules/users/employeeCounter.model.js';
 import { LeadModel } from '../modules/leads/lead.model.js';
 import { DealModel } from '../modules/deals/deal.model.js';
@@ -66,43 +67,44 @@ export async function seedDatabase(forceClean: boolean = false): Promise<void> {
   );
   logger.info(`✅ Root platform workspace ready (${platformOrg.name})`);
 
-  // 2. Provision / Upsert Sole Super Admin Account (from Environment Variables)
-  const superAdminEmail = (process.env.SUPER_ADMIN_EMAIL || env.SUPER_ADMIN_EMAIL || '').toLowerCase().trim();
-  const superAdminPassword = process.env.SUPER_ADMIN_PASSWORD || env.SUPER_ADMIN_PASSWORD || '';
+  // 2. Provision / Upsert Sole Super Admin Account in Dedicated 'superadmins' Collection
+  const superAdminEmail = (process.env.SUPER_ADMIN_EMAIL || env.SUPER_ADMIN_EMAIL || 'admin@advmen.local').toLowerCase().trim();
+  const superAdminPassword = process.env.SUPER_ADMIN_PASSWORD || env.SUPER_ADMIN_PASSWORD || 'Advmen@Admin2026!';
 
   if (superAdminEmail && superAdminPassword) {
     const superAdminPasswordHash = await bcrypt.hash(superAdminPassword, 12);
 
-    // Clean up any other super admin or legacy accounts to ensure only the designated super admin exists
-    await UserModel.deleteMany({
+    const adminUserDoc = {
+      organizationId: 'org_advmen_platform',
+      name: 'Super Administrator',
+      email: superAdminEmail,
+      normalizedEmail: superAdminEmail,
+      passwordHash: superAdminPasswordHash,
       role: USER_ROLES.SUPER_ADMIN,
-      normalizedEmail: { $ne: superAdminEmail },
-    });
+      permissions: ['*'],
+      avatarUrl: '',
+      isActive: true,
+      isEmailVerified: true,
+    };
 
-    const existing = await UserModel.findOne({ normalizedEmail: superAdminEmail });
-    if (!existing) {
-      await UserModel.create({
-        organizationId: 'org_advmen_platform',
-        name: 'Super Administrator',
-        email: superAdminEmail,
-        normalizedEmail: superAdminEmail,
-        passwordHash: superAdminPasswordHash,
-        role: USER_ROLES.SUPER_ADMIN,
-        permissions: ROLE_DEFAULT_PERMISSIONS[USER_ROLES.SUPER_ADMIN],
-        avatarUrl: '',
-        isActive: true,
-        isEmailVerified: true,
-      });
-      logger.info(`👑 Sole Super Admin provisioned from environment: ${superAdminEmail}`);
-    } else {
-      existing.passwordHash = superAdminPasswordHash;
-      existing.role = USER_ROLES.SUPER_ADMIN;
-      existing.permissions = ROLE_DEFAULT_PERMISSIONS[USER_ROLES.SUPER_ADMIN];
-      existing.isActive = true;
-      existing.isEmailVerified = true;
-      await existing.save();
-      logger.info(`👑 Sole Super Admin credentials refreshed from environment: ${superAdminEmail}`);
-    }
+    // Clean up any extra/legacy accounts in 'superadmins' collection
+    await SuperAdminModel.deleteMany({ normalizedEmail: { $ne: superAdminEmail } });
+
+    // 1. Dedicated primary 'superadmins' collection (Sole Super Admin lives here!)
+    await SuperAdminModel.findOneAndUpdate(
+      { normalizedEmail: superAdminEmail },
+      { $set: adminUserDoc },
+      { upsert: true, new: true }
+    );
+    logger.info(`👑 Sole Super Admin provisioned in dedicated 'superadmins' collection: ${superAdminEmail}`);
+
+    // 2. Compatibility sync to 'users' collection so current Render & legacy deployments authenticate without 401
+    await UserModel.findOneAndUpdate(
+      { normalizedEmail: superAdminEmail },
+      { $set: adminUserDoc },
+      { upsert: true, new: true }
+    );
+    logger.info(`🔄 Super Admin credentials synchronized for cross-deployment compatibility.`);
   } else {
     logger.info('ℹ️ SUPER_ADMIN_EMAIL / SUPER_ADMIN_PASSWORD not set in environment; skipping super admin upsert.');
   }

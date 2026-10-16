@@ -395,6 +395,144 @@ export class AttendanceService {
     return record;
   }
 
+  /**
+   * Explicit employee punch-in with optional selfie and GPS coordinates.
+   * Guarantees persistence directly into MongoDB 'attendances' collection.
+   */
+  async recordPunchIn(input: {
+    userId: string;
+    organizationId: string;
+    employeeId?: string;
+    name: string;
+    email: string;
+    phone?: string;
+    role?: string;
+    department?: string;
+    selfieUrl?: string;
+    selfie?: string;
+    selfieData?: string;
+    location?: {
+      lat?: number;
+      lng?: number;
+      address?: string;
+      accuracy?: number;
+      googleMapsUrl?: string;
+    };
+    ipAddress?: string;
+    userAgent?: string;
+    notes?: string;
+  }): Promise<IAttendance> {
+    const today = this.getTodayDateString();
+    const now = new Date();
+    const timeParts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(now);
+    const hour = Number(timeParts.find((part) => part.type === 'hour')?.value || 0);
+    const minute = Number(timeParts.find((part) => part.type === 'minute')?.value || 0);
+    const second = Number(timeParts.find((part) => part.type === 'second')?.value || 0);
+
+    // Official checkin time is 10:00 AM IST. Any check-in after 10:05 AM is recorded as HALF_DAY
+    const isAfter1005 = hour > 10 || (hour === 10 && (minute > 5 || (minute === 5 && second > 0)));
+    const status: AttendanceStatus = isAfter1005 ? 'HALF_DAY' : 'PRESENT';
+
+    const attendanceQuery = {
+      organizationId: input.organizationId,
+      userId: input.userId,
+      date: today,
+    };
+
+    const loginEvent = {
+      loginTime: now,
+      ipAddress: input.ipAddress || 'Selfie + GPS',
+      userAgent: input.userAgent || (input.location?.address ? `Location: ${input.location.address}` : 'Sales CRM Web Portal'),
+    };
+
+    let record = await AttendanceModel.findOne(attendanceQuery);
+
+    if (record) {
+      record.lastActiveAt = now;
+      if (input.selfieUrl) record.selfieUrl = input.selfieUrl;
+      if (input.selfie) record.selfie = input.selfie;
+      if (input.selfieData) record.selfieData = input.selfieData;
+      if (input.location) record.location = input.location;
+      if (input.notes) record.notes = input.notes;
+      record.logoutTime = undefined as any;
+      record.logoutBy = undefined as any;
+      record.logoutAdminName = undefined as any;
+
+      if (!Array.isArray(record.loginEvents)) record.loginEvents = [];
+      const hasRecent = record.loginEvents.some(
+        (e) => Math.abs(new Date(e.loginTime).getTime() - now.getTime()) < 5000
+      );
+      if (!hasRecent) {
+        record.loginEvents.push(loginEvent as any);
+      }
+      await record.save();
+    } else {
+      record = await AttendanceModel.create({
+        organizationId: input.organizationId,
+        userId: input.userId,
+        employeeId: input.employeeId || 'EMP',
+        userName: input.name,
+        userEmail: input.email,
+        userPhone: input.phone || '',
+        role: input.role || 'SALES_REP',
+        department: input.department || 'Sales & Business Development',
+        date: today,
+        loginTime: now,
+        lastActiveAt: now,
+        status,
+        selfieUrl: input.selfieUrl,
+        selfie: input.selfie,
+        selfieData: input.selfieData,
+        location: input.location,
+        loginEvents: [loginEvent],
+        source: 'SYSTEM_LOGIN',
+        notes: input.notes,
+      });
+    }
+
+    logger.info(`✅ Employee Punch-In recorded: ${input.name} (${input.employeeId || record.employeeId}) [${status}] on ${today}`);
+
+    try {
+      const payload = {
+        id: record._id.toString(),
+        userId: record.userId,
+        employeeId: record.employeeId,
+        userName: record.userName,
+        userEmail: record.userEmail,
+        userPhone: record.userPhone,
+        department: record.department,
+        role: record.role,
+        date: record.date,
+        loginTime: now,
+        status: record.status,
+        selfieUrl: record.selfieUrl,
+        location: record.location,
+      };
+
+      emitTenantEvent(input.organizationId, 'attendance:punchin', payload);
+      emitTenantEvent(input.organizationId, 'attendance:updated', payload);
+      emitTenantEvent(input.organizationId, 'notification:new', {
+        id: `punch_${Date.now()}`,
+        type: 'attendance',
+        title: `Punch-In: ${record.userName}`,
+        message: `${record.userName} (${record.employeeId}) punched in at ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} [${status}]`,
+        severity: status === 'HALF_DAY' ? 'warning' : 'success',
+        link: '/attendance',
+        timestamp: now.toISOString(),
+      });
+    } catch (e: any) {
+      logger.warn('Socket broadcast warning:', e.message);
+    }
+
+    return record;
+  }
+
   private lastSyncTime: number = 0;
   private isSyncing: boolean = false;
 
@@ -518,13 +656,20 @@ export class AttendanceService {
                   }
                 }
 
+                const rawDocUserId = String(doc.userId || (doc.user?._id || doc.user || '')).trim();
+                const rawPhone = String(doc.phone || doc.userPhone || '').replace(/\D/g, '');
+
                 // Match user from users collection
                 let matchedUser = users.find(
                   (u) =>
+                    (rawDocUserId && u._id.toString() === rawDocUserId) ||
+                    (rawDocUserId && u.employeeId && u.employeeId.toUpperCase() === rawDocUserId.toUpperCase()) ||
                     (rawEmail && u.email && u.email.toLowerCase() === rawEmail) ||
+                    (rawEmail && (u as any).normalizedEmail && (u as any).normalizedEmail === rawEmail) ||
                     (rawEmpId && u.employeeId && u.employeeId.toUpperCase() === rawEmpId.toUpperCase()) ||
                     (rawEmpId && (u as any).empId && (u as any).empId.toUpperCase() === rawEmpId.toUpperCase()) ||
-                    (rawEmpName && u.name && u.name.toLowerCase() === rawEmpName.toLowerCase())
+                    (rawPhone.length >= 7 && u.phone && u.phone.replace(/\D/g, '').slice(-10) === rawPhone.slice(-10)) ||
+                    (rawEmpName && u.name && u.name.trim().toLowerCase() === rawEmpName.toLowerCase())
                 );
 
                 // Fuzzy match fallback
@@ -671,8 +816,9 @@ export class AttendanceService {
 
             for (const r of (reportsToSync as any[])) {
               if (!r.userId || (!r.workReport && !r.workCategory)) continue;
+              const repDate = r.date || (r.loginTime ? new Date(r.loginTime).toISOString().slice(0, 10) : new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()));
               await ReportModel.updateOne(
-                { organizationId: r.organizationId, userId: r.userId, date: r.date },
+                { organizationId: r.organizationId, userId: r.userId, date: repDate },
                 {
                   $set: {
                     organizationId: r.organizationId,
@@ -682,7 +828,7 @@ export class AttendanceService {
                     userEmail: r.userEmail || '',
                     department: r.department || 'General',
                     role: r.role || 'EMPLOYEE',
-                    date: r.date,
+                    date: repDate,
                     workCategory: r.workCategory || 'General Work',
                     workReport: r.workReport || '',
                     developmentChanges: r.developmentChanges || '',
@@ -989,60 +1135,73 @@ export class AttendanceService {
       selectedDate: string;
     };
   }> {
-    if (Date.now() - this.lastSyncTime > 15000 && !this.isSyncing) {
-      this.syncExternalAttendance(organizationId, false).catch((err) => {
+    if (Date.now() - this.lastSyncTime > 5000 && !this.isSyncing) {
+      await this.syncExternalAttendance(organizationId, false).catch((err) => {
         logger.warn('External attendance auto-sync note:', err.message);
       });
     }
 
     const selectedDate = filters.date && filters.date !== 'ALL' ? filters.date : this.getTodayDateString();
-    const query: Record<string, any> = {};
+    const andClauses: any[] = [];
 
     if (!isSuperAdmin && organizationId) {
-      query.organizationId = filters.search && filters.search.startsWith('org_') ? filters.search : organizationId;
+      andClauses.push({
+        $or: [
+          { organizationId: filters.search && filters.search.startsWith('org_') ? filters.search : organizationId },
+          { organizationId: { $exists: false } },
+          { organizationId: null },
+          { organizationId: '' },
+        ],
+      });
     } else if (filters.search && filters.search.startsWith('org_')) {
-      query.organizationId = filters.search;
+      andClauses.push({ organizationId: filters.search });
     }
 
-    if (filters.date) {
-      if (filters.date !== 'ALL') {
-        const dateVal = filters.date;
-        const dateParts = dateVal.split('-');
-        if (dateParts.length === 3 && dateParts[0].length === 4) {
-          const altDate1 = `${dateParts[2]}-${dateParts[1]}-${dateParts[0]}`;
-          const altDate2 = `${dateParts[2]}/${dateParts[1]}/${dateParts[0]}`;
-          query.date = { $in: [dateVal, altDate1, altDate2] };
-        } else {
-          query.date = dateVal;
-        }
+    const targetDate = filters.date && filters.date !== 'ALL' ? filters.date : (!filters.startDate && !filters.endDate ? selectedDate : undefined);
+
+    if (targetDate) {
+      const dateParts = targetDate.split('-');
+      const altDate1 = dateParts.length === 3 ? `${dateParts[2]}-${dateParts[1]}-${dateParts[0]}` : '';
+      const altDate2 = dateParts.length === 3 ? `${dateParts[2]}/${dateParts[1]}/${dateParts[0]}` : '';
+      const altDate3 = dateParts.length === 3 ? `${dateParts[0]}/${dateParts[1]}/${dateParts[2]}` : '';
+      const dateVariants = [targetDate, altDate1, altDate2, altDate3].filter(Boolean);
+
+      const [y, m, d] = targetDate.split('-').map(Number);
+      const dateOr: any[] = [
+        { date: { $in: dateVariants } },
+        { date: new RegExp(`^${targetDate}`, 'i') },
+      ];
+      if (!isNaN(y) && !isNaN(m) && !isNaN(d)) {
+        const startOfDayUTC = new Date(Date.UTC(y, m - 1, d, 0, 0, 0) - 5.5 * 3600 * 1000);
+        const endOfDayUTC = new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999) - 5.5 * 3600 * 1000);
+        dateOr.push(
+          { loginTime: { $gte: startOfDayUTC, $lte: endOfDayUTC } },
+          { createdAt: { $gte: startOfDayUTC, $lte: endOfDayUTC } }
+        );
       }
+      andClauses.push({ $or: dateOr });
     } else if (filters.startDate && filters.endDate) {
-      query.date = { $gte: filters.startDate, $lte: filters.endDate };
-    } else {
-      const todayParts = selectedDate.split('-');
-      if (todayParts.length === 3 && todayParts[0].length === 4) {
-        const altToday1 = `${todayParts[2]}-${todayParts[1]}-${todayParts[0]}`;
-        const altToday2 = `${todayParts[2]}/${todayParts[1]}/${todayParts[0]}`;
-        query.date = { $in: [selectedDate, altToday1, altToday2] };
-      } else {
-        query.date = selectedDate;
-      }
+      andClauses.push({ date: { $gte: filters.startDate, $lte: filters.endDate } });
     }
 
-    if (filters.userId) query.userId = filters.userId;
-    if (filters.status) query.status = filters.status;
-    if (filters.department && filters.department !== 'ALL') query.department = filters.department;
+    if (filters.userId) andClauses.push({ userId: filters.userId });
+    if (filters.status) andClauses.push({ status: filters.status });
+    if (filters.department && filters.department !== 'ALL') andClauses.push({ department: filters.department });
 
     if (filters.search && !filters.search.startsWith('org_')) {
       const regex = new RegExp(filters.search.trim(), 'i');
-      query.$or = [
-        { userName: regex },
-        { userEmail: regex },
-        { userPhone: regex },
-        { department: regex },
-        { employeeId: regex },
-      ];
+      andClauses.push({
+        $or: [
+          { userName: regex },
+          { userEmail: regex },
+          { userPhone: regex },
+          { department: regex },
+          { employeeId: regex },
+        ],
+      });
     }
+
+    const query: Record<string, any> = andClauses.length > 0 ? { $and: andClauses } : {};
 
     const page = Math.max(1, Number(filters.page) || 1);
     const limit = Math.min(Math.max(1, Number(filters.limit) || 50), 100);
