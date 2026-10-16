@@ -41,7 +41,7 @@ export class UserRepository {
     ]);
 
     return {
-      users,
+      users: users as unknown as IUser[],
       total,
       page,
       totalPages: Math.ceil(total / limit) || 1,
